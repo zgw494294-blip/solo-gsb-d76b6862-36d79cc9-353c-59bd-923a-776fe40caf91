@@ -24,6 +24,7 @@ from app.copies import (
     ModifyConflictError,
     NotHeldError,
     RevisionMismatchError,
+    RevisionNotFound,
 )
 from app.migration import DecisionError, apply_decisions, migrate_annotations
 from app.nesting import NestingError, audit_nesting, export_nesting, validate_rules
@@ -499,6 +500,8 @@ def _copy_snapshot(action):
         raise HTTPException(status_code=404, detail=str(exc))
     except CopyNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc))
+    except RevisionNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
 
 
 @app.post("/api/copies", status_code=201)
@@ -510,6 +513,22 @@ def create_copy(req: CopyRequest):
 @app.get("/api/copies/{copy_id}")
 def read_copy(copy_id: str):
     return _copy_snapshot(lambda: get_store().get(copy_id))
+
+
+@app.get("/api/copies/{copy_id}/revisions")
+def list_copy_revisions(copy_id: str):
+    """按 revision 升序列出该副本已记录版本的操作信息（只读，不改状态）。"""
+    return _copy_snapshot(lambda: {
+        "id": copy_id,
+        "revisions": get_store().list_revisions(copy_id),
+    })
+
+
+@app.get("/api/copies/{copy_id}/revisions/{revision}")
+def read_copy_revision(copy_id: str, revision: int):
+    """读取指定版本的完整快照（只读，不改变当前状态）。"""
+    return _copy_snapshot(
+        lambda: get_store().get_revision(copy_id, revision))
 
 
 # 批注 id 允许任意唯一字符串（含空串、"/" 与换行）：ann_id 使用能匹配

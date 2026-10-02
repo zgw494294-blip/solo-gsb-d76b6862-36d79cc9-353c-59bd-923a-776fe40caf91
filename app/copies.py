@@ -30,6 +30,16 @@ label），初始**无人持有**。
 持久化，每个变更操作在进程级锁内「完整读入 → 纯核心运算 → 整体写回」，
 因此并发请求等价于逐次完整执行，不会丢失其他批注的修改。旧库启动时自动
 补 `status` 列，旧副本默认 `open` 且原 `revision` 不变。
+
+**版本历史（回看）**：创建时记录 `revision=1` 的完整快照；此后每次使
+`revision` 递增的变更（领取 / 释放 / 修改 / 结稿）都把新版本的完整快照
+（文本、批注、持有者、`status` 与原排序）连同操作类型与 reviewer（创建、
+结稿与基线补记为 `None`）写入历史表，且**与副本变更在同一事务提交**——
+任一步写入失败二者均不变；本人重复领取（幂等）与失败请求都不产生记录。
+锁内串行执行保证各版本快照就是该次提交的状态，不会混入后续版本。旧库
+启动时只为**没有任何历史记录**的副本补一条当前 `revision` 的 `baseline`
+快照（不编造早期历史、不改原数据，重复启动不重复补记），历史随原卷跨
+重启保留。`list_revisions` / `get_revision` 只读回看，不改变当前状态。
 """
 
 from __future__ import annotations
@@ -118,6 +128,16 @@ class CopyNotFound(LookupError):
     def __init__(self, copy_id: str):
         self.copy_id = copy_id
         super().__init__(f"工作副本不存在：{copy_id}")
+
+
+class RevisionNotFound(LookupError):
+    """工作副本没有该版本的历史快照记录（对应 HTTP 404）。"""
+
+    def __init__(self, copy_id: str, revision: int):
+        self.copy_id = copy_id
+        self.revision = revision
+        super().__init__(
+            f"工作副本 {copy_id} 没有已记录的版本快照：revision={revision}")
 
 
 class AnnotationNotFound(LookupError):
@@ -366,6 +386,33 @@ CREATE TABLE IF NOT EXISTS annotations (
 );
 CREATE INDEX IF NOT EXISTS idx_annotations_copy_pos
     ON annotations(copy_id, pos);
+-- 版本历史：每次已提交的变更（含创建）记录一条完整快照；
+-- op 为 create / claim / release / modify / finalize / baseline，
+-- reviewer 对 create / finalize / baseline 为 NULL。
+CREATE TABLE IF NOT EXISTS revisions (
+    copy_id  TEXT NOT NULL REFERENCES copies(id) ON DELETE CASCADE,
+    revision INTEGER NOT NULL,
+    op       TEXT NOT NULL,
+    reviewer TEXT,
+    text     TEXT NOT NULL,
+    status   TEXT NOT NULL,
+    PRIMARY KEY (copy_id, revision)
+);
+CREATE TABLE IF NOT EXISTS revision_annotations (
+    copy_id  TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    ann_id   TEXT NOT NULL,
+    pos      INTEGER NOT NULL,
+    start    INTEGER NOT NULL,
+    end      INTEGER NOT NULL,
+    label    TEXT NOT NULL,
+    holder   TEXT,
+    PRIMARY KEY (copy_id, revision, ann_id),
+    FOREIGN KEY (copy_id, revision)
+        REFERENCES revisions(copy_id, revision) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_revision_annotations_copy_rev_pos
+    ON revision_annotations(copy_id, revision, pos);
 """
 
 
@@ -412,7 +459,9 @@ class CopyStore:
         """建表（幂等）：随容器启动初始化，重启后数据保留。
 
         旧库缺少 ``status`` 列时自动补列：既有副本默认 ``open``，
-        原 ``revision`` 不变。
+        原 ``revision`` 不变。旧库缺少历史记录时为每个副本补一条
+        **当前** ``revision`` 的 ``baseline`` 快照（不编造早期历史、
+        不改原数据）；已有任何版本记录的副本跳过，重复启动不重复补记。
         """
         self.path.parent.mkdir(parents=True, exist_ok=True)
         conn = self._connect()
@@ -425,9 +474,41 @@ class CopyStore:
                 conn.execute(
                     "ALTER TABLE copies "
                     "ADD COLUMN status TEXT NOT NULL DEFAULT 'open'")
+            # 基线补记：仅对没有任何历史记录的副本（本功能上线前创建）
+            # 补当前 revision 的一条快照；新功能创建的副本自带 create 记录，
+            # 不会进入此分支，因此重复启动不会重复补记。
+            missing = [r[0] for r in conn.execute(
+                "SELECT c.id FROM copies c WHERE NOT EXISTS "
+                "(SELECT 1 FROM revisions r WHERE r.copy_id = c.id)")]
+            for cid in missing:
+                self._record_revision(
+                    conn, self._load(conn, cid), "baseline", None)
             conn.commit()
         finally:
             conn.close()
+
+    def _record_revision(self, conn: sqlite3.Connection, state: "CopyState",
+                         op: str, reviewer: str | None) -> None:
+        """在同一事务内记录 state 当前版本的完整快照（调用方负责提交/回滚）。
+
+        快照内容：文本、status、全部批注（含持有者与原排序）。与副本变更
+        同事务写入——任一步失败二者均回滚；锁内串行执行保证快照就是本次
+        提交的状态，不会混入后续版本。
+        """
+        conn.execute(
+            "INSERT INTO revisions(copy_id, revision, op, reviewer, text, "
+            "status) VALUES(?, ?, ?, ?, ?, ?)",
+            (state.copy_id, state.revision, op, reviewer,
+             state.text, state.status))
+        conn.executemany(
+            "INSERT INTO revision_annotations(copy_id, revision, ann_id, pos, "
+            "start, end, label, holder) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+            [(state.copy_id, state.revision, ann_id, pos,
+              state.annotations[ann_id]["start"],
+              state.annotations[ann_id]["end"],
+              state.annotations[ann_id]["label"],
+              state.holders.get(ann_id))
+             for pos, ann_id in enumerate(state.order)])
 
     def _load(self, conn: sqlite3.Connection, copy_id: str) -> CopyState:
         row = conn.execute(
@@ -449,7 +530,10 @@ class CopyStore:
         return state
 
     def create(self, text: str, annotations: list[dict]) -> dict:
-        """创建工作副本，返回其初始快照（初始无人持有，revision=1）。"""
+        """创建工作副本，返回其初始快照（初始无人持有，revision=1）。
+
+        副本与 revision=1 的初始历史快照（op=create）在同一事务提交。
+        """
         copy_id = uuid.uuid4().hex
         with self._lock:
             conn = self._connect()
@@ -462,6 +546,8 @@ class CopyStore:
                     "label, holder) VALUES(?, ?, ?, ?, ?, ?, NULL)",
                     [(copy_id, a["id"], i, a["start"], a["end"], a["label"])
                      for i, a in enumerate(annotations)])
+                self._record_revision(
+                    conn, CopyState(copy_id, text, annotations), "create", None)
                 conn.commit()
             except BaseException:
                 conn.rollback()
@@ -479,8 +565,14 @@ class CopyStore:
             finally:
                 conn.close()
 
-    def _apply(self, copy_id: str, operation) -> dict:
-        """在锁内完整执行「读入 → 运算 → 整体写回」，失败不写任何内容。"""
+    def _apply(self, copy_id: str, operation, op: str,
+               reviewer: str | None) -> dict:
+        """在锁内完整执行「读入 → 运算 → 整体写回」，失败不写任何内容。
+
+        成功变更把新版本的完整历史快照（含操作类型 op 与 reviewer）与副本
+        变更在同一事务提交——任一步写入失败二者均不变；幂等领取（运算返回
+        False）与失败请求都不产生版本记录。
+        """
         with self._lock:
             conn = self._connect()
             try:
@@ -500,6 +592,9 @@ class CopyStore:
                           state.annotations[i]["label"],
                           state.holders.get(i), copy_id, i)
                          for i in state.order])
+                    # 历史快照与副本变更同一事务提交；锁内串行保证快照就是
+                    # 本次提交的状态，不会混入后续版本。
+                    self._record_revision(conn, state, op, reviewer)
                     conn.commit()
             except BaseException:
                 conn.rollback()
@@ -509,18 +604,79 @@ class CopyStore:
         return self.get(copy_id)
 
     def claim(self, copy_id: str, ann_id: str, reviewer: str) -> dict:
-        return self._apply(copy_id, lambda st: st.claim(ann_id, reviewer))
+        return self._apply(copy_id, lambda st: st.claim(ann_id, reviewer),
+                           "claim", reviewer)
 
     def release(self, copy_id: str, ann_id: str, reviewer: str) -> dict:
-        return self._apply(copy_id, lambda st: st.release(ann_id, reviewer))
+        return self._apply(copy_id, lambda st: st.release(ann_id, reviewer),
+                           "release", reviewer)
 
     def modify(self, copy_id: str, ann_id: str, reviewer: str,
                start: int, end: int, label: str) -> dict:
         return self._apply(
             copy_id,
-            lambda st: st.modify(ann_id, reviewer, start, end, label))
+            lambda st: st.modify(ann_id, reviewer, start, end, label),
+            "modify", reviewer)
 
     def finalize(self, copy_id: str, expected_revision: int) -> dict:
         """结稿：与领取 / 释放 / 修改在同一进程锁内串行，等价于某个先后次序。"""
         return self._apply(
-            copy_id, lambda st: st.finalize(expected_revision))
+            copy_id, lambda st: st.finalize(expected_revision),
+            "finalize", None)  # 结稿不携带 reviewer
+
+    # ---------- 版本历史（只读回看，不改变当前状态） ----------
+
+    def list_revisions(self, copy_id: str) -> list[dict]:
+        """按 revision 升序列出已记录版本的操作信息；未知副本抛 CopyNotFound。"""
+        with self._lock:
+            conn = self._connect()
+            try:
+                if conn.execute("SELECT 1 FROM copies WHERE id=?",
+                                (copy_id,)).fetchone() is None:
+                    raise CopyNotFound(copy_id)
+                rows = conn.execute(
+                    "SELECT revision, op, reviewer FROM revisions "
+                    "WHERE copy_id=? ORDER BY revision", (copy_id,)).fetchall()
+                return [{"revision": rev, "op": op, "reviewer": reviewer}
+                        for rev, op, reviewer in rows]
+            finally:
+                conn.close()
+
+    def get_revision(self, copy_id: str, revision: int) -> dict:
+        """读取指定版本的完整快照（只读，不改变当前状态）。
+
+        未知副本抛 ``CopyNotFound``、副本没有该版本的记录抛
+        ``RevisionNotFound``（均对应 HTTP 404）。
+        """
+        with self._lock:
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    "SELECT text, status, op, reviewer FROM revisions "
+                    "WHERE copy_id=? AND revision=?",
+                    (copy_id, revision)).fetchone()
+                if row is None:
+                    if conn.execute("SELECT 1 FROM copies WHERE id=?",
+                                    (copy_id,)).fetchone() is None:
+                        raise CopyNotFound(copy_id)
+                    raise RevisionNotFound(copy_id, revision)
+                text, status, op, reviewer = row
+                rows = conn.execute(
+                    "SELECT ann_id, pos, start, end, label, holder "
+                    "FROM revision_annotations "
+                    "WHERE copy_id=? AND revision=? ORDER BY pos",
+                    (copy_id, revision)).fetchall()
+                state = CopyState(
+                    copy_id, text,
+                    [{"id": r[0], "start": r[2], "end": r[3], "label": r[4]}
+                     for r in rows],
+                    revision=revision, status=status)
+                for r in rows:
+                    if r[5] is not None:
+                        state.holders[r[0]] = r[5]
+                snap = state.snapshot()
+                snap["op"] = op
+                snap["reviewer"] = reviewer
+                return snap
+            finally:
+                conn.close()
