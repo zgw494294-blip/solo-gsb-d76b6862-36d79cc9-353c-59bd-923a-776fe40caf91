@@ -218,6 +218,21 @@ def test_slash_and_literal_percent2f_are_distinct(client):
     assert client.post(_url(cid, "a%2Fb", "release"),
                        json={"reviewer": "bob"}).status_code == 200
 
+    # 版本回看：含 "/" 与字面 "%2F" 的 id 原样保留、互不串台；
+    # create + 2 claim + 2 modify + 2 release = 7 个已记录版本
+    revs = client.get(f"/api/copies/{cid}/revisions").json()["revisions"]
+    assert [r["revision"] for r in revs] == list(range(1, 8))
+    assert [r["operation"] for r in revs] == [
+        "create", "claim", "claim", "modify", "modify", "release", "release"]
+    assert [r["reviewer"] for r in revs] == [
+        None, "alice", "bob", "alice", "bob", "alice", "bob"]
+    for r in revs:  # 两个特殊 id 在每个版本都完整可区分
+        assert [a["id"] for a in r["annotations"]] == ["a/b", "a%2Fb"]
+    # 单版本读取：第 3 版（两次领取后）持有者分别归属
+    r3 = client.get(f"/api/copies/{cid}/revisions/3").json()
+    assert {a["id"]: a["holder"] for a in r3["annotations"]} == \
+        {"a/b": "alice", "a%2Fb": "bob"}
+
 
 # ---------- 含其他保留字符的任意唯一字符串 id ----------
 

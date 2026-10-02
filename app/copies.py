@@ -30,10 +30,22 @@ label），初始**无人持有**。
 持久化，每个变更操作在进程级锁内「完整读入 → 纯核心运算 → 整体写回」，
 因此并发请求等价于逐次完整执行，不会丢失其他批注的修改。旧库启动时自动
 补 `status` 列，旧副本默认 `open` 且原 `revision` 不变。
+
+**版本回看**：每次成功提交都在同一事务内写入一条不可变版本记录——创建时
+保存 `revision=1` 的完整快照（`operation=create`、`reviewer=null`）；领取 /
+释放 / 修改 / 结稿使 `revision` 递增时保存新版本的文本、批注（**原排序**）、
+持有者与 `status`，并附操作类型（`claim` / `release` / `modify` /
+`finalize`）与 `reviewer`（结稿为 `null`）。本人重复领取（幂等、不增版本）
+及一切失败请求（422 / 409 / 404）**不产生记录**；快照与副本变更同事务提交，
+写入失败二者均不变，因此并发时已提交的快照永远对应该次提交、不会混入后续
+版本。旧库（无版本表的数据库）启动时只为每个旧副本补**当前 revision** 的一条
+`operation=baseline` 快照，不编造早期历史、不改原数据，重复启动不重复补记；
+历史随原卷在同一数据库中跨重启保留。
 """
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import threading
@@ -118,6 +130,16 @@ class CopyNotFound(LookupError):
     def __init__(self, copy_id: str):
         self.copy_id = copy_id
         super().__init__(f"工作副本不存在：{copy_id}")
+
+
+class RevisionNotFound(LookupError):
+    """副本存在但该 revision 未记录（对应 HTTP 404）。"""
+
+    def __init__(self, copy_id: str, revision: int):
+        self.copy_id = copy_id
+        self.revision = revision
+        super().__init__(
+            f"工作副本 {copy_id} 不存在已记录的 revision={revision}")
 
 
 class AnnotationNotFound(LookupError):
@@ -344,6 +366,34 @@ class CopyState:
             ],
         }
 
+    def revision_snapshot(self, operation: str,
+                          reviewer: str | None) -> dict:
+        """生成历史版本完整快照：文本、批注（**原排序**、含持有者）、status。
+
+        与 :meth:`snapshot` 不同，批注按创建时的**原排序**（``self.order``）
+        原样保存、不重排，因此回看任意版本时文本、批注、持有者、status 与
+        原排序都能整体还原；连通组在读取时由几何重算，不入库。``operation``
+        为产生该版本的操作类型（``create`` / ``claim`` / ``release`` /
+        ``modify`` / ``finalize`` / ``baseline``），``reviewer`` 为操作审阅者
+        （创建、结稿、基线为 ``None``）。
+        """
+        return {
+            "id": self.copy_id,
+            "text": self.text,
+            "revision": self.revision,
+            "status": self.status,
+            "operation": operation,
+            "reviewer": reviewer,
+            "annotations": [
+                {"id": i,
+                 "start": self.annotations[i]["start"],
+                 "end": self.annotations[i]["end"],
+                 "label": self.annotations[i]["label"],
+                 "holder": self.holders.get(i)}
+                for i in self.order
+            ],
+        }
+
 
 # ---------- SQLite 持久化 ----------
 
@@ -366,6 +416,14 @@ CREATE TABLE IF NOT EXISTS annotations (
 );
 CREATE INDEX IF NOT EXISTS idx_annotations_copy_pos
     ON annotations(copy_id, pos);
+CREATE TABLE IF NOT EXISTS copy_revisions (
+    copy_id   TEXT NOT NULL REFERENCES copies(id) ON DELETE CASCADE,
+    revision  INTEGER NOT NULL,
+    operation TEXT NOT NULL,
+    reviewer  TEXT,
+    payload   TEXT NOT NULL,
+    PRIMARY KEY (copy_id, revision)
+);
 """
 
 
@@ -413,6 +471,12 @@ class CopyStore:
 
         旧库缺少 ``status`` 列时自动补列：既有副本默认 ``open``，
         原 ``revision`` 不变。
+
+        旧库（``copy_revisions`` 版本表为空 / 新建前已存在的副本没有任何
+        版本记录）启动时为每个旧副本补**当前 revision** 的一条 ``baseline``
+        快照——只补起点、不编造早期历史，原副本数据（文本、批注、持有者、
+        revision、status）一概不改；以「该副本尚无任何版本记录」为补记条件，
+        重复启动不会重复补记。
         """
         self.path.parent.mkdir(parents=True, exist_ok=True)
         conn = self._connect()
@@ -425,7 +489,20 @@ class CopyStore:
                 conn.execute(
                     "ALTER TABLE copies "
                     "ADD COLUMN status TEXT NOT NULL DEFAULT 'open'")
+            # 旧副本补当前 revision 的 baseline 快照（与补列同事务提交）：
+            # NOT EXISTS 保证只在该副本一条版本记录都没有时补记，重复启动
+            # 不重复补；此后副本变更产生的新版本照常追加，不影响旧副本。
+            rows = conn.execute(
+                "SELECT c.id FROM copies c WHERE NOT EXISTS ( "
+                "SELECT 1 FROM copy_revisions r WHERE r.copy_id = c.id)"
+            ).fetchall()
+            for (copy_id,) in rows:
+                state = self._load(conn, copy_id)
+                self._insert_revision(conn, state, "baseline", None)
             conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
         finally:
             conn.close()
 
@@ -448,20 +525,62 @@ class CopyStore:
                 state.holders[r[0]] = r[5]
         return state
 
+    @staticmethod
+    def _insert_revision(conn: sqlite3.Connection, state: CopyState,
+                         operation: str, reviewer: str | None) -> None:
+        """把该次提交的完整快照写入版本表（须由调用方在同一事务内提交）。
+
+        快照与副本变更共享同一事务：任一步失败整体回滚，副本与版本记录
+        要么同时生效、要么都不变；锁内串行使记录的 revision 必为该次提交
+        的版本，不会混入并发的后续版本。
+        """
+        record = state.revision_snapshot(operation, reviewer)
+        conn.execute(
+            "INSERT INTO copy_revisions(copy_id, revision, operation, "
+            "reviewer, payload) VALUES(?, ?, ?, ?, ?)",
+            (state.copy_id, state.revision, operation, reviewer,
+             json.dumps(record, ensure_ascii=False)))
+
+    @staticmethod
+    def _revision_view(record: dict) -> dict:
+        """把存储的版本记录还原为完整快照（批注原排序 + 重算的连通组）。
+
+        组不在版本记录中存储，读取时按该版本快照的几何与持有者重算，
+        与 :meth:`CopyState.snapshot` 的结果保持同一形态。
+        """
+        state = CopyState(
+            record["id"], record["text"], record["annotations"],
+            revision=record["revision"], status=record["status"])
+        for a in record["annotations"]:
+            if a["holder"] is not None:
+                state.holders[a["id"]] = a["holder"]
+        view = state.snapshot()
+        # snapshot() 的批注按稳定顺序重排；版本回看按保存时的**原排序**返回
+        view["annotations"] = record["annotations"]
+        view["operation"] = record["operation"]
+        view["reviewer"] = record["reviewer"]
+        return view
+
     def create(self, text: str, annotations: list[dict]) -> dict:
-        """创建工作副本，返回其初始快照（初始无人持有，revision=1）。"""
+        """创建工作副本，返回其初始快照（初始无人持有，revision=1）。
+
+        副本与 ``revision=1`` 的 ``create`` 版本快照在同一事务内提交。
+        """
         copy_id = uuid.uuid4().hex
         with self._lock:
             conn = self._connect()
             try:
                 conn.execute(
-                    "INSERT INTO copies(id, text, revision) VALUES(?, ?, 1)",
+                    "INSERT INTO copies(id, text, revision, status) "
+                    "VALUES(?, ?, 1, 'open')",
                     (copy_id, text))
                 conn.executemany(
                     "INSERT INTO annotations(copy_id, ann_id, pos, start, end, "
                     "label, holder) VALUES(?, ?, ?, ?, ?, ?, NULL)",
                     [(copy_id, a["id"], i, a["start"], a["end"], a["label"])
                      for i, a in enumerate(annotations)])
+                state = self._load(conn, copy_id)
+                self._insert_revision(conn, state, "create", None)
                 conn.commit()
             except BaseException:
                 conn.rollback()
@@ -479,8 +598,57 @@ class CopyStore:
             finally:
                 conn.close()
 
-    def _apply(self, copy_id: str, operation) -> dict:
-        """在锁内完整执行「读入 → 运算 → 整体写回」，失败不写任何内容。"""
+    def list_revisions(self, copy_id: str) -> list[dict]:
+        """按 revision 升序列出版本及操作信息（不改变当前状态）。
+
+        每项为该版本的完整快照（文本、批注原排序、持有者、status、连通组）
+        附 ``operation`` 与 ``reviewer``；未知副本抛 `CopyNotFound`（404）。
+        """
+        with self._lock:
+            conn = self._connect()
+            try:
+                if conn.execute("SELECT 1 FROM copies WHERE id=?",
+                                (copy_id,)).fetchone() is None:
+                    raise CopyNotFound(copy_id)
+                rows = conn.execute(
+                    "SELECT payload FROM copy_revisions "
+                    "WHERE copy_id=? ORDER BY revision ASC",
+                    (copy_id,)).fetchall()
+                return [self._revision_view(json.loads(r[0])) for r in rows]
+            finally:
+                conn.close()
+
+    def get_revision(self, copy_id: str, revision: int) -> dict:
+        """读取指定 revision 的完整快照（不改变当前状态）。
+
+        未知副本 → `CopyNotFound`（404）；副本存在但该版本未记录 →
+        `RevisionNotFound`（404，如旧库只补了当前 revision 的 baseline，
+        更早的版本不编造、读取返回 404）。
+        """
+        with self._lock:
+            conn = self._connect()
+            try:
+                if conn.execute("SELECT 1 FROM copies WHERE id=?",
+                                (copy_id,)).fetchone() is None:
+                    raise CopyNotFound(copy_id)
+                row = conn.execute(
+                    "SELECT payload FROM copy_revisions "
+                    "WHERE copy_id=? AND revision=?",
+                    (copy_id, revision)).fetchone()
+                if row is None:
+                    raise RevisionNotFound(copy_id, revision)
+                return self._revision_view(json.loads(row[0]))
+            finally:
+                conn.close()
+
+    def _apply(self, copy_id: str, operation, op_name: str,
+               reviewer: str | None) -> dict:
+        """在锁内完整执行「读入 → 运算 → 整体写回」，失败不写任何内容。
+
+        发生 revision 递增的成功提交时，副本变更与该版本完整快照在同一
+        事务内写入（``op_name`` / ``reviewer`` 记录操作类型与审阅者）；
+        幂等领取（``changed is False``）与一切抛错都不产生版本记录。
+        """
         with self._lock:
             conn = self._connect()
             try:
@@ -500,6 +668,7 @@ class CopyStore:
                           state.annotations[i]["label"],
                           state.holders.get(i), copy_id, i)
                          for i in state.order])
+                    self._insert_revision(conn, state, op_name, reviewer)
                     conn.commit()
             except BaseException:
                 conn.rollback()
@@ -509,18 +678,22 @@ class CopyStore:
         return self.get(copy_id)
 
     def claim(self, copy_id: str, ann_id: str, reviewer: str) -> dict:
-        return self._apply(copy_id, lambda st: st.claim(ann_id, reviewer))
+        return self._apply(copy_id, lambda st: st.claim(ann_id, reviewer),
+                           "claim", reviewer)
 
     def release(self, copy_id: str, ann_id: str, reviewer: str) -> dict:
-        return self._apply(copy_id, lambda st: st.release(ann_id, reviewer))
+        return self._apply(copy_id, lambda st: st.release(ann_id, reviewer),
+                           "release", reviewer)
 
     def modify(self, copy_id: str, ann_id: str, reviewer: str,
                start: int, end: int, label: str) -> dict:
         return self._apply(
             copy_id,
-            lambda st: st.modify(ann_id, reviewer, start, end, label))
+            lambda st: st.modify(ann_id, reviewer, start, end, label),
+            "modify", reviewer)
 
     def finalize(self, copy_id: str, expected_revision: int) -> dict:
         """结稿：与领取 / 释放 / 修改在同一进程锁内串行，等价于某个先后次序。"""
         return self._apply(
-            copy_id, lambda st: st.finalize(expected_revision))
+            copy_id, lambda st: st.finalize(expected_revision),
+            "finalize", None)

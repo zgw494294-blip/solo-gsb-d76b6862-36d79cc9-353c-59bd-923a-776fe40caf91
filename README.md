@@ -221,6 +221,24 @@
 - **并发**：所有变更请求（含结稿）在服务端串行化，等价于**逐次完整执行**，
   不会丢失其他批注的修改；结稿与领取 / 释放 / 修改并发时等价于某个先后次序，
   不会出现结稿成功后仍写入修改或领取的情况；每次成功变更 `revision` 加 1。
+- **版本回看**：每次成功提交都在**同一事务**内保存一条不可变版本快照——
+  **创建**即保存 `revision=1` 的完整快照（`operation=create`、`reviewer=null`）；
+  **领取 / 释放 / 修改 / 结稿**使 `revision` 递增时，保存该版本的**文本、批注
+  （创建时的原排序）、持有者、`status`**，并附操作类型（`claim` / `release` /
+  `modify` / `finalize`）与 `reviewer`（结稿为 `null`）。**本人重复领取**
+  （幂等、不增版本）与一切**失败请求**（422 / 409 / 404）**不产生记录**；
+  快照写入失败时副本变更一并回滚（二者同生共死），并发下每条快照只对应该次
+  提交、不会混入后续版本。历史随原卷在同一 SQLite 中**跨重启保留**；**旧库**
+  （版本表上线前的数据库）启动时只为每个旧副本补**当前 revision** 的一条
+  `operation=baseline`、`reviewer=null` 快照——**不编造早期历史**、不改原数据，
+  更早的 revision 读取返回 **404**，重复启动不重复补记。
+  - `GET /api/copies/{id}/revisions`：按 `revision` **升序**列出版本及操作信息，
+    返回 `{"revisions":[…]}`；每项即该版本的**完整快照**（与单个副本读取同形：
+    文本、按**原排序**的批注含 `holder`、重算的连通组、`revision`、`status`），
+    另附 `operation` 与 `reviewer`；未知副本 **404**。
+  - `GET /api/copies/{id}/revisions/{revision}`：读取指定版本的**完整快照**
+    （纯只读，不改变当前状态）；未知副本或该版本**未记录**（含旧库补 baseline
+    之前的早期版本、0、负数、非整数版本号）均返回 **404**。
 - **读取**：`GET` 返回**同一提交状态**下的固定文本、`status`（`open` /
   `finalized`）、全部批注（含 `holder`，未持有为 `null`）、按稳定顺序排列的
   连通组（每组附 `holder`）与 `revision`。读取到的批注可**直接用于原审阅接口**
@@ -230,7 +248,8 @@ SQLite 数据库在容器内位于 `/data/copies.db`（`docker-compose.yml` 的�
 `copies-data`，随容器启动自动建表，重启保留副本与结稿状态）；可用环境变量
 `COPY_DB_PATH` 覆盖路径，本地开发默认回退到仓库根目录 `data/copies.db`（已在
 `.gitignore`）。**旧库启动时自动补 `status` 列**：既有副本默认 `open`，
-原 `revision` 不变。
+原 `revision` 不变；同时为每个尚无版本记录的旧副本补**当前 revision** 的一条
+`baseline` 快照（不编造早期历史，重复启动不重复补记）。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -240,6 +259,8 @@ SQLite 数据库在容器内位于 `/data/copies.db`（`docker-compose.yml` 的�
 | POST | `/api/copies/{id}/annotations/{ann_id}/release` | 入参 `{reviewer}`，**持有者整组释放**；无人持有 / 他人持有 / 已结稿 **409**，`reviewer` 非法 **422**；`ann_id` 编码规则同 claim |
 | PATCH | `/api/copies/{id}/annotations/{ann_id}` | 入参 `{reviewer, start, end, label}`，仅持有者改单条范围与 label，随后重算分组；触及他人 **409**（范围与持有权均不变），未持有 / 已结稿 **409**，非法区间 / 空 label **422**。空串 id 的 URL 为 `.../annotations/`（以斜杠结尾）；`/`、字面 `%2F`、换行 `\n` 分别写作 `%2F`、`%252F`、`%0A` |
 | POST | `/api/copies/{id}/finalize` | 入参 `{expected_revision}`（正整数，布尔 **422**），版本一致且无持有者时结稿为 `finalized`（`revision += 1`，其余不变），返回该次提交完整快照；版本过期 / 仍有持有者 / 已结稿 **409**，未知副本 **404**；结稿后领取 / 释放 / 修改均 **409**，不提供重开 |
+| GET | `/api/copies/{id}/revisions` | 按 `revision` **升序**返回 `{"revisions":[…]}`，每项为该版本完整快照（文本、**原排序**批注含 `holder`、连通组、`revision`、`status`）附 `operation`（`create` / `claim` / `release` / `modify` / `finalize` / `baseline`）与 `reviewer`（创建 / 结稿 / 基线为 `null`）；重复领取与失败请求不留痕；未知副本 **404**；纯只读 |
+| GET | `/api/copies/{id}/revisions/{revision}` | 读取指定版本完整快照（不改变当前状态）；未知副本或该版本未记录（旧库 baseline 之前的早期版本、0、负数、非整数）均 **404** |
 
 ```bash
 # 创建工作副本：a 与 b 正长度重叠同组；b 与 c 相接不连边；d 独立
@@ -302,6 +323,35 @@ curl -s -o /dev/null -w '%{http_code}\n' -X PATCH \
 curl -s -o /dev/null -w '%{http_code}\n' -X POST \
   http://localhost:8000/api/copies/$CID/finalize \
   -H 'Content-Type: application/json' -d '{"expected_revision":7}'   # 409（已结稿）
+
+# 回看全部已提交版本：按 revision 升序，每项附 operation 与 reviewer
+curl -s http://localhost:8000/api/copies/$CID/revisions \
+  | python3 -c 'import json,sys;
+                for r in json.load(sys.stdin)["revisions"]:
+                    print(r["revision"], r["operation"], r["reviewer"], r["status"])'
+# → 1 create None open
+#   2 claim alice open        （alice 领取 {a,b}）
+#   3 claim bob open          （bob 领取 c；失败请求与重复领取均不在此列）
+#   4 release alice open      （alice 释放 {a,b}）
+#   5 modify bob open         （bob 修改 c）
+#   6 release bob open
+#   7 finalize None finalized
+
+# 读取某个 revision 的完整快照（原排序批注 + 持有者 + 该版本几何重算的连通组），
+# 纯只读、不改变当前状态；早期版本同样可回看
+curl -s http://localhost:8000/api/copies/$CID/revisions/2 \
+  | python3 -c 'import json,sys; r=json.load(sys.stdin);
+                print(r["revision"], r["operation"], r["reviewer"]);
+                print({a["id"]: a["holder"] for a in r["annotations"]})'
+# → 2 claim alice
+#   {"a": "alice", "b": "alice", "c": null, "d": None}
+
+# 未知副本 / 未记录版本一律 404（旧库只补了当前 revision 的 baseline，
+# 更早的版本不编造，读取同样 404）
+curl -s -o /dev/null -w '%{http_code}\n' \
+  http://localhost:8000/api/copies/$CID/revisions/99                # 404
+curl -s -o /dev/null -w '%{http_code}\n' \
+  http://localhost:8000/api/copies/deadbeef/revisions              # 404
 ```
 
 ### 特殊批注 id（空串、含 `/`、字面 `%2F` 与换行）的可执行调用
@@ -750,6 +800,8 @@ JSON」得到：
 | POST | `/api/copies/{id}/annotations/{ann_id}/release` | 入参 `{reviewer}`，持有者本人整组释放；无人持有 / 他人持有 / 已结稿 **409**，非法 reviewer **422**；`ann_id` 编码规则同 claim |
 | PATCH | `/api/copies/{id}/annotations/{ann_id}` | 入参 `{reviewer,start,end,label}`，仅持有者改单条范围与 label（不增删批注）后重算分组：并入的未领取批注归本人，触及他人 **409**（范围与持有权均不变），拆开的组保留原持有者；未持有 / 已结稿 **409**，非法区间 / 空 label / 非法 reviewer **422**；并发请求等价逐次完整执行。空串 id 的 URL 以斜杠结尾（`.../annotations/`），服务端只解码一次且完整保留解码后的每个字符，故 `/`（`%2F`）与字面 `%2F`（`%252F`）、`a` 与 `a\n`（`a%0A`）均不混同 |
 | POST | `/api/copies/{id}/finalize` | 入参 `{expected_revision}`（正整数，布尔 / 非正数 **422**），把副本结稿为不可再改的定稿：仅 `status` 由 `open` 变 `finalized`、`revision += 1`，返回该次提交完整快照（文本、批注、持有权与排序不变）；版本过期 / 仍有持有者 / 已结稿 **409**（失败不改任何状态），未知副本 **404**；结稿后有效的领取 / 释放 / 修改均 **409**，不提供重开；结稿与其他变更并发等价于某个先后次序 |
+| GET | `/api/copies/{id}/revisions` | 按 `revision` **升序**返回 `{"revisions":[…]}`；每项为该版本完整快照（文本、**原排序**批注含 `holder`、连通组、`revision`、`status`）附 `operation`（`create` / `claim` / `release` / `modify` / `finalize` / `baseline`）与 `reviewer`（创建 / 结稿 / 基线为 `null`）；创建即记录 revision=1，重复领取与失败请求不留痕；未知副本 **404**；纯只读 |
+| GET | `/api/copies/{id}/revisions/{revision}` | 读取指定版本完整快照（纯只读、不改变当前状态）；未知副本或版本未记录（旧库 baseline 之前的早期版本、0、负数、非整数）均 **404** |
 
 迁移导出条目状态取值：`shifted` / `matched` / `disambiguated` / `manual` / `abandoned`（废弃项 `start`、`end` 为 `null`）。
 
@@ -926,7 +978,7 @@ app/
   review.py          # 审阅切片核心：顺序装箱、窗口均分与边界余量转移、JSONL 导出、审阅结果校验回导
   relabel.py         # 标签体系迁移核心：规则集校验（目标标签 / 正则 / 回退约束）、迁移链求值（循环与缺规则检测）、导出重算
   redaction.py       # 遮盖导出核心：命中区间重叠/相接合并、[遮盖] 替换、可见片段拆分与新码点坐标换算
-  copies.py          # 可领取审阅工作副本：正长度重叠传递分组（相接不连边）、整组领取/释放、持有者改单条后重算分组、乐观版本结稿（open→finalized，不可重开），SQLite 持久化（进程锁串行化，旧库自动补 status 列，重启保留）
+  copies.py          # 可领取审阅工作副本：正长度重叠传递分组（相接不连边）、整组领取/释放、持有者改单条后重算分组、乐观版本结稿（open→finalized，不可重开），版本回看（revision 不可变快照、操作类型与 reviewer、原排序），SQLite 持久化（进程锁串行化，快照与变更同事务，旧库自动补 status 列与当前 revision 的 baseline，重启保留）
   static/            # 原生 HTML/CSS/JS 前端（index.html 迁移页、arbitrate.html 仲裁页、sequence.html 序列标注页、nesting.html 嵌套审计页、units.html 制式转换页、review.html 审阅切片页、relabel.html 标签体系迁移页）
 tests/
   test_migration.py
@@ -941,6 +993,8 @@ tests/
   test_copy_store.py
   test_copy_api.py
   test_copy_finalize.py      # 结稿：HTTP / 持久化 / 旧库迁移 / 并发先后次序
+  test_copy_history.py       # 版本回看：逐版本快照与操作信息、重复领取/失败不留痕、原子提交、并发不混版本、旧库仅补当前 baseline、跨重启保留
+  test_copy_history_http.py  # 版本回看 HTTP：升序列出、单版本只读快照、404、特殊 id 原排序
   test_copy_special_ids_http.py  # 空串 / 含"/" / 字面"%2F" / 含换行 特殊 id 的真实 HTTP（uvicorn）全流程回归
   test_validation.py
 Dockerfile
